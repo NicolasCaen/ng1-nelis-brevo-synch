@@ -67,7 +67,7 @@ class Ng1NelisBrevSync {
             'brevo_api_key'       => 'Clé API Brevo',
             'brevo_list_id'       => 'ID du groupe Brevo',
             'sync_frequency'      => 'Fréquence de sync',
-            'nelis_offset'        => 'Décalage de départ (offset)'
+            'batch_size'          => 'Taille des lots (par défaut: 100)'
         );
 
         foreach ($fields as $field_id => $field_title) {
@@ -97,6 +97,10 @@ class Ng1NelisBrevSync {
             echo '<option value="twicedaily"' . selected($value, 'twicedaily', false) . '>Deux fois par jour</option>';
             echo '<option value="daily"' . selected($value, 'daily', false) . '>Quotidienne</option>';
             echo '</select>';
+        } elseif ($field_id === 'batch_size') {
+            $batch_size = !empty($value) ? intval($value) : 100;
+            echo '<input type="number" name="' . $this->option_name . '[' . $field_id . ']" value="' . esc_attr($batch_size) . '" class="regular-text" min="1" max="1000" />';
+            echo '<p class="description">Nombre de contacts à traiter par lot (recommandé: 100)</p>';
         } elseif (in_array($field_id, ['nelis_password', 'nelis_client_secret', 'brevo_api_key'])) {
             echo '<input type="password" name="' . $this->option_name . '[' . $field_id . ']" value="' . esc_attr($value) . '" class="regular-text" />';
         } else {
@@ -173,7 +177,7 @@ class Ng1NelisBrevSync {
                 throw new Exception('Code de réponse HTTP : ' . $code);
             }
         } catch (Exception $e) {
-            wp_send_json_error(['message' => 'Erreur de connexion à l’API Nelis : ' . $e->getMessage()]);
+            wp_send_json_error(['message' => 'Erreur de connexion à API Nelis : ' . $e->getMessage()]);
         }
     }
 
@@ -202,12 +206,11 @@ class Ng1NelisBrevSync {
         return $data['access_token'];
     }
 
-    private function get_nelis_contacts($options) {
-        $offset = isset($options['nelis_offset']) ? intval($options['nelis_offset']) : 0;
-        $offsetmax = $offset + 100;
-        $range= trim($offset.'-'.$offsetmax);
+    private function get_nelis_contacts_batch($options, $offset = 0, $limit = 100) {
+        $offsetmax = $offset + $limit;
+        $range = trim($offset . '-' . $offsetmax);
 
-        $url = rtrim($options['nelis_api_url'], '/') . '/api/v4/people?limit=100&range=' . $range;
+        $url = rtrim($options['nelis_api_url'], '/') . '/api/v4/people?limit=' . $limit . '&range=' . $range;
         $access_token = $this->get_access_token($options);
         $args = array(
             'headers' => array(
@@ -228,14 +231,59 @@ class Ng1NelisBrevSync {
         return $data['items'] ?? $data ?? array();
     }
 
+    private function get_all_nelis_contacts($options) {
+        $all_contacts = array();
+        $batch_size = isset($options['batch_size']) && !empty($options['batch_size']) ? intval($options['batch_size']) : 100;
+        $offset = 0;
+        $batch_number = 1;
+        
+        $this->log("Début de la récupération de tous les contacts Nelis (taille des lots: {$batch_size})");
+        
+        while (true) {
+            try {
+                $this->log("Récupération du lot #{$batch_number} (range: {$offset}-" . ($offset + $batch_size) . ")");
+                
+                $contacts_batch = $this->get_nelis_contacts_batch($options, $offset, $batch_size);
+                
+                if (empty($contacts_batch)) {
+                    $this->log("Aucun contact trouvé dans le lot #{$batch_number}. Fin de la récupération.");
+                    break;
+                }
+                
+                $contact_count = count($contacts_batch);
+                $this->log("Lot #{$batch_number} : {$contact_count} contacts récupérés");
+                
+                $all_contacts = array_merge($all_contacts, $contacts_batch);
+                
+                // Si le nombre de contacts récupérés est inférieur à la taille du lot,
+                // cela signifie qu'on a atteint la fin
+                if ($contact_count < $batch_size) {
+                    $this->log("Dernier lot atteint (contacts récupérés < taille du lot). Fin de la récupération.");
+                    break;
+                }
+                
+                $offset += $batch_size;
+                $batch_number++;
+                
+                // Petite pause entre les requêtes pour éviter de surcharger l'API
+                sleep(1);
+                
+            } catch (Exception $e) {
+                $this->log("Erreur lors de la récupération du lot #{$batch_number} : " . $e->getMessage());
+                break;
+            }
+        }
+        
+        $total_contacts = count($all_contacts);
+        $this->log("Récupération terminée : {$total_contacts} contacts au total récupérés en {$batch_number} lots");
+        
+        return $all_contacts;
+    }
+
     private function sync_contact_to_brevo($contact, $options) {
-   
         if (empty($contact['email'])) {
-           // error_log("empty email");
-           error_log(json_encode($contact));
+            error_log(json_encode($contact));
             return false;
-        }else{
-          // error_log("email sync : ".  $contact['email']);
         }
         
         $url = 'https://api.brevo.com/v3/contacts';
@@ -260,7 +308,6 @@ class Ng1NelisBrevSync {
         );
         $response = wp_remote_post($url, $args);
         if (is_wp_error($response)) {
-      
             $this->log('Erreur Brevo pour ' . $contact['email'] . ' : ' . $response->get_error_message());
             return false;
         }
@@ -282,24 +329,56 @@ class Ng1NelisBrevSync {
             $this->log('Erreur : Paramètres de configuration manquants');
             return false;
         }
+        
         try {
-            $nelis_contacts = $this->get_nelis_contacts($options);
+            $start_time = microtime(true);
+            $this->log('=== DÉBUT DE LA SYNCHRONISATION COMPLÈTE ===');
+            
+            // Récupération de tous les contacts Nelis
+            $nelis_contacts = $this->get_all_nelis_contacts($options);
+            
             if (empty($nelis_contacts)) {
                 $this->log('Aucun contact à synchroniser depuis Nelis');
                 return false;
             }
+            
+            $total_contacts = count($nelis_contacts);
+            $this->log("Début de la synchronisation vers Brevo de {$total_contacts} contacts");
+            
             $synced_count = 0;
             $error_count = 0;
+            $processed = 0;
+            
             foreach ($nelis_contacts as $contact) {
+                $processed++;
+                
                 if ($this->sync_contact_to_brevo($contact, $options)) {
                     $synced_count++;
                 } else {
                     $error_count++;
                 }
+                
+                // Log de progression tous les 50 contacts
+                if ($processed % 50 === 0) {
+                    $this->log("Progression: {$processed}/{$total_contacts} contacts traités ({$synced_count} synchronisés, {$error_count} erreurs)");
+                }
+                
+                // Petite pause tous les 10 contacts pour éviter de surcharger l'API Brevo
+                if ($processed % 10 === 0) {
+                    usleep(500000); // 0.5 seconde
+                }
             }
-            $this->log("Synchronisation terminée : {$synced_count} contacts synchronisés, {$error_count} erreurs");
+            
+            $end_time = microtime(true);
+            $duration = round($end_time - $start_time, 2);
+            
+            $this->log("=== SYNCHRONISATION TERMINÉE ===");
+            $this->log("Durée totale: {$duration} secondes");
+            $this->log("Résultats: {$synced_count} contacts synchronisés, {$error_count} erreurs sur {$total_contacts} contacts traités");
+            
             $this->update_cron_frequency($options);
             return true;
+            
         } catch (Exception $e) {
             $this->log('Erreur lors de la synchronisation : ' . $e->getMessage());
             return false;
@@ -322,7 +401,7 @@ class Ng1NelisBrevSync {
             'timestamp' => current_time('mysql'),
             'message' => $message
         );
-        $logs = array_slice($logs, -50);
+        $logs = array_slice($logs, -100); // Augmenté à 100 pour garder plus de logs
         update_option('ng1_nelis_brevo_sync_logs', $logs);
     }
 
@@ -333,7 +412,7 @@ class Ng1NelisBrevSync {
             return;
         }
         $logs = array_reverse($logs);
-        foreach (array_slice($logs, 0, 10) as $log) {
+        foreach (array_slice($logs, 0, 20) as $log) { // Affichage des 20 derniers logs
             echo '<p><strong>' . esc_html($log['timestamp']) . '</strong> : ' . esc_html($log['message']) . '</p>';
         }
     }
