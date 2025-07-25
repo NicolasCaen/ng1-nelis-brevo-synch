@@ -204,7 +204,10 @@ class Ng1NelisBrevSync {
 
     private function get_nelis_contacts($options) {
         $offset = isset($options['nelis_offset']) ? intval($options['nelis_offset']) : 0;
-        $url = rtrim($options['nelis_api_url'], '/') . '/api/v4/people?limit=100&offset=' . $offset;
+        $offsetmax = $offset + 100;
+        $range= trim($offset.'-'.$offsetmax);
+
+        $url = rtrim($options['nelis_api_url'], '/') . '/api/v4/people?limit=100&range=' . $range;
         $access_token = $this->get_access_token($options);
         $args = array(
             'headers' => array(
@@ -226,9 +229,15 @@ class Ng1NelisBrevSync {
     }
 
     private function sync_contact_to_brevo($contact, $options) {
+   
         if (empty($contact['email'])) {
+           // error_log("empty email");
+           error_log(json_encode($contact));
             return false;
+        }else{
+          // error_log("email sync : ".  $contact['email']);
         }
+        
         $url = 'https://api.brevo.com/v3/contacts';
         $payload = array(
             'email' => $contact['email'],
@@ -251,6 +260,7 @@ class Ng1NelisBrevSync {
         );
         $response = wp_remote_post($url, $args);
         if (is_wp_error($response)) {
+      
             $this->log('Erreur Brevo pour ' . $contact['email'] . ' : ' . $response->get_error_message());
             return false;
         }
