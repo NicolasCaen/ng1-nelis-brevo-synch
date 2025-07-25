@@ -177,7 +177,7 @@ class Ng1NelisBrevSync {
                 throw new Exception('Code de réponse HTTP : ' . $code);
             }
         } catch (Exception $e) {
-            wp_send_json_error(['message' => 'Erreur de connexion à API Nelis : ' . $e->getMessage()]);
+            wp_send_json_error(['message' => 'Erreur de connexion à lAPI Nelis : ' . $e->getMessage()]);
         }
     }
 
@@ -206,7 +206,7 @@ class Ng1NelisBrevSync {
         return $data['access_token'];
     }
 
-    private function get_nelis_contacts_batch($options, $offset = 0, $limit = 100) {
+    private function get_nelis_contacts_batch($options, $offset = 500, $limit = 100) {
         $offsetmax = $offset + $limit;
         $range = trim($offset . '-' . $offsetmax);
 
@@ -280,19 +280,35 @@ class Ng1NelisBrevSync {
         return $all_contacts;
     }
 
+    private function is_valid_email($email) {
+        // Validation basique de l'email
+        if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+        
+        // Vérification des caractères interdits ou problématiques
+        if (strpos($email, ' / ') !== false || strpos($email, ' ') !== false) {
+            return false;
+        }
+        
+        return true;
+    }
+
     private function sync_contact_to_brevo($contact, $options) {
-        if (empty($contact['email'])) {
-            error_log(json_encode($contact));
+        if (empty($contact['email']) || !$this->is_valid_email($contact['email'])) {
+            if (!empty($contact['email'])) {
+                $this->log('Email invalide ignoré: ' . $contact['email']);
+            }
             return false;
         }
         
         $url = 'https://api.brevo.com/v3/contacts';
         $payload = array(
-            'email' => $contact['email'],
+            'email' => trim($contact['email']),
             'attributes' => array(
-                'FIRSTNAME' => $contact['firstname'] ?? '',
-                'LASTNAME'  => $contact['lastname'] ?? '',
-                'PHONE'     => $contact['phone'] ?? ''
+                'FIRSTNAME' => isset($contact['firstname']) ? trim($contact['firstname']) : '',
+                'LASTNAME'  => isset($contact['lastname']) ? trim($contact['lastname']) : '',
+                'PHONE'     => isset($contact['phone']) ? trim($contact['phone']) : ''
             ),
             'listIds' => array(intval($options['brevo_list_id'])),
             'updateEnabled' => true
@@ -306,22 +322,122 @@ class Ng1NelisBrevSync {
             'body' => json_encode($payload),
             'timeout' => 30
         );
-        $response = wp_remote_post($url, $args);
-        if (is_wp_error($response)) {
-            $this->log('Erreur Brevo pour ' . $contact['email'] . ' : ' . $response->get_error_message());
-            return false;
+        
+        // Retry logic pour gérer les erreurs temporaires
+        $max_retries = 3;
+        $retry_count = 0;
+        
+        while ($retry_count < $max_retries) {
+            $response = wp_remote_post($url, $args);
+            
+            if (is_wp_error($response)) {
+                $retry_count++;
+                if ($retry_count < $max_retries) {
+                    $this->log('Erreur temporaire Brevo pour ' . $contact['email'] . ', tentative ' . $retry_count . '/' . $max_retries);
+                    sleep(2); // Pause de 2 secondes avant retry
+                    continue;
+                } else {
+                    $this->log('Erreur Brevo définitive pour ' . $contact['email'] . ' : ' . $response->get_error_message());
+                    return false;
+                }
+            }
+            
+            $response_code = wp_remote_retrieve_response_code($response);
+            
+            // Gestion des codes de réponse
+            if ($response_code === 201 || $response_code === 204) {
+                return true;
+            } elseif ($response_code === 400) {
+                // Erreur de validation - ne pas retry
+                $body = wp_remote_retrieve_body($response);
+                $this->log('Erreur de validation Brevo (400) pour ' . $contact['email'] . ' : ' . $body);
+                return false;
+            } elseif ($response_code === 429) {
+                // Rate limit atteint
+                $retry_count++;
+                if ($retry_count < $max_retries) {
+                    $this->log('Rate limit Brevo atteint pour ' . $contact['email'] . ', pause de 5 secondes (tentative ' . $retry_count . '/' . $max_retries . ')');
+                    sleep(5);
+                    continue;
+                } else {
+                    $this->log('Rate limit Brevo persistant pour ' . $contact['email']);
+                    return false;
+                }
+            } else {
+                $body = wp_remote_retrieve_body($response);
+                $this->log('Erreur Brevo (' . $response_code . ') pour ' . $contact['email'] . ' : ' . $body);
+                return false;
+            }
         }
-        $response_code = wp_remote_retrieve_response_code($response);
-        if ($response_code === 201 || $response_code === 204) {
-            return true;
-        } else {
-            $body = wp_remote_retrieve_body($response);
-            $this->log('Erreur Brevo (' . $response_code . ') pour ' . $contact['email'] . ' : ' . $body);
-            return false;
+        
+        return false;
+    }
+    
+    private function sync_contacts_to_brevo_batch($contacts, $options, $batch_start) {
+        $synced_count = 0;
+        $error_count = 0;
+        $skipped_count = 0;
+        
+        $this->log("Début de la synchronisation du lot Brevo (contacts " . ($batch_start + 1) . " à " . ($batch_start + count($contacts)) . ")");
+        
+        foreach ($contacts as $index => $contact) {
+            $global_index = $batch_start + $index + 1;
+            
+            try {
+                // Vérification de la limite de temps d'exécution
+                if (function_exists('set_time_limit')) {
+                    set_time_limit(300); // Réinitialiser à 5 minutes
+                }
+                
+                // Validation de l'email avant traitement
+                if (empty($contact['email']) || !$this->is_valid_email($contact['email'])) {
+                    $skipped_count++;
+                    if (!empty($contact['email'])) {
+                        $this->log("Contact #{$global_index} ignoré - email invalide: " . $contact['email']);
+                    }
+                    continue;
+                }
+                
+                if ($this->sync_contact_to_brevo($contact, $options)) {
+                    $synced_count++;
+                } else {
+                    $error_count++;
+                }
+                
+                // Pause tous les 5 contacts pour éviter de surcharger l'API
+                if (($index + 1) % 5 === 0) {
+                    usleep(300000); // 0.3 seconde
+                }
+                
+                // Pause plus longue et log tous les 25 contacts
+                if (($index + 1) % 25 === 0) {
+                    $this->log("Lot Brevo - Progression: " . ($index + 1) . "/" . count($contacts) . " contacts traités (S:{$synced_count} E:{$error_count} I:{$skipped_count})");
+                    sleep(1); // 1 seconde
+                }
+                
+            } catch (Exception $e) {
+                $error_count++;
+                $this->log("Erreur fatale pour le contact #{$global_index}: " . $e->getMessage());
+                
+                // En cas d'erreur fatale, on continue avec le suivant
+                continue;
+            }
         }
+        
+        $this->log("Lot Brevo terminé: {$synced_count} synchronisés, {$error_count} erreurs, {$skipped_count} ignorés");
+        
+        return array('synced' => $synced_count, 'errors' => $error_count, 'skipped' => $skipped_count);
     }
 
     public function execute_sync() {
+        // Augmenter les limites pour les grosses synchronisations
+        if (function_exists('set_time_limit')) {
+            set_time_limit(0); // Pas de limite de temps
+        }
+        if (function_exists('ini_set')) {
+            ini_set('memory_limit', '512M'); // Augmenter la mémoire
+        }
+        
         $options = get_option($this->option_name);
         if (empty($options['nelis_api_url']) || empty($options['nelis_username']) || empty($options['nelis_password']) ||
             empty($options['nelis_client_id']) || empty($options['nelis_client_secret']) ||
@@ -345,27 +461,52 @@ class Ng1NelisBrevSync {
             $total_contacts = count($nelis_contacts);
             $this->log("Début de la synchronisation vers Brevo de {$total_contacts} contacts");
             
-            $synced_count = 0;
-            $error_count = 0;
-            $processed = 0;
+            // Traitement par lots de 200 pour Brevo (réduit pour plus de stabilité)
+            $brevo_batch_size = 200;
+            $total_synced = 0;
+            $total_errors = 0;
+            $total_skipped = 0;
+            $batch_number = 1;
             
-            foreach ($nelis_contacts as $contact) {
-                $processed++;
-                
-                if ($this->sync_contact_to_brevo($contact, $options)) {
-                    $synced_count++;
-                } else {
-                    $error_count++;
-                }
-                
-                // Log de progression tous les 50 contacts
-                if ($processed % 50 === 0) {
-                    $this->log("Progression: {$processed}/{$total_contacts} contacts traités ({$synced_count} synchronisés, {$error_count} erreurs)");
-                }
-                
-                // Petite pause tous les 10 contacts pour éviter de surcharger l'API Brevo
-                if ($processed % 10 === 0) {
-                    usleep(500000); // 0.5 seconde
+            for ($i = 0; $i < $total_contacts; $i += $brevo_batch_size) {
+                try {
+                    $batch_contacts = array_slice($nelis_contacts, $i, $brevo_batch_size);
+                    $batch_count = count($batch_contacts);
+                    
+                    $this->log("=== TRAITEMENT DU LOT BREVO #{$batch_number} ===");
+                    $this->log("Contacts " . ($i + 1) . " à " . ($i + $batch_count) . " sur {$total_contacts}");
+                    
+                    // Réinitialiser la limite de temps pour chaque lot
+                    if (function_exists('set_time_limit')) {
+                        set_time_limit(600); // 10 minutes par lot
+                    }
+                    
+                    // Synchronisation du lot
+                    $batch_results = $this->sync_contacts_to_brevo_batch($batch_contacts, $options, $i);
+                    
+                    $total_synced += $batch_results['synced'];
+                    $total_errors += $batch_results['errors'];
+                    $total_skipped += isset($batch_results['skipped']) ? $batch_results['skipped'] : 0;
+                    
+                    $this->log("Lot #{$batch_number} terminé: {$batch_results['synced']} synchronisés, {$batch_results['errors']} erreurs, " . (isset($batch_results['skipped']) ? $batch_results['skipped'] : 0) . " ignorés");
+                    
+                    // Pause longue entre les lots (sauf pour le dernier)
+                    if ($i + $brevo_batch_size < $total_contacts) {
+                        $this->log("Pause de 15 secondes avant le prochain lot...");
+                        sleep(15);
+                    }
+                    
+                    $batch_number++;
+                    
+                    // Mise à jour du progress
+                    $progress_percent = round((($i + $batch_count) / $total_contacts) * 100, 1);
+                    $this->log("Progression globale: {$progress_percent}% ({$total_synced} synchronisés, {$total_errors} erreurs, {$total_skipped} ignorés)");
+                    
+                } catch (Exception $batch_error) {
+                    $this->log("Erreur fatale dans le lot #{$batch_number}: " . $batch_error->getMessage());
+                    $this->log("Tentative de continuer avec le lot suivant...");
+                    $batch_number++;
+                    continue;
                 }
             }
             
@@ -374,13 +515,14 @@ class Ng1NelisBrevSync {
             
             $this->log("=== SYNCHRONISATION TERMINÉE ===");
             $this->log("Durée totale: {$duration} secondes");
-            $this->log("Résultats: {$synced_count} contacts synchronisés, {$error_count} erreurs sur {$total_contacts} contacts traités");
+            $this->log("Résultats finaux: {$total_synced} contacts synchronisés, {$total_errors} erreurs, {$total_skipped} ignorés sur {$total_contacts} contacts traités");
+            $this->log("Nombre de lots Brevo traités: " . ($batch_number - 1));
             
             $this->update_cron_frequency($options);
             return true;
             
         } catch (Exception $e) {
-            $this->log('Erreur lors de la synchronisation : ' . $e->getMessage());
+            $this->log('Erreur fatale lors de la synchronisation : ' . $e->getMessage());
             return false;
         }
     }
